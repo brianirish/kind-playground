@@ -108,7 +108,14 @@ install_ca(){
 
   sudo cp -f .ssl/root-ca.pem /usr/local/share/ca-certificates/kind.cluster/ca.crt
 
-  sudo update-ca-certificates
+  if command -v update-ca-certificates >/dev/null 2>&1; then
+    sudo update-ca-certificates
+  elif command -v security >/dev/null 2>&1; then
+    sudo security add-trusted-cert -d -r trustRoot -k /Library/Keychains/System.keychain /usr/local/share/ca-certificates/kind.cluster/ca.crt
+  else
+    echo "Error: Cannot install the kind cluster certificate because the required system commands are not available."
+    exit 1
+  fi
 }
 
 cluster(){
