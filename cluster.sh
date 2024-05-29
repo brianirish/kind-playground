@@ -4,9 +4,15 @@ set -e
 
 # CONSTANTS
 
-readonly KIND_NODE_IMAGE=kindest/node:v1.23.3
+readonly KIND_NODE_IMAGE=kindest/node:v1.30.0
 readonly DNSMASQ_DOMAIN=kind.cluster
-readonly DNSMASQ_CONF=kind.k8s.conf
+if [[ "$(uname)" == "Darwin" ]]; then
+  readonly DNSMASQ_CONF_PATH="$(brew --prefix)/etc"
+  readonly DNSMASQ_CONF_FILENAME="dnsmasq.conf"
+elif [[ "$(uname)" == "Linux" ]]; then
+  readonly DNSMASQ_CONF_PATH="/etc/dnsmasq.d"
+  readonly DNSMASQ_CONF_FILENAME="kind.k8s.conf"
+fi
 
 # FUNCTIONS
 
@@ -209,7 +215,7 @@ cilium(){
 
   helm upgrade --install --wait --timeout 15m --atomic --namespace kube-system --create-namespace \
     --repo https://helm.cilium.io cilium cilium --values - <<EOF
-kubeProxyReplacement: strict
+kubeProxyReplacement: true
 k8sServiceHost: kind-external-load-balancer
 k8sServicePort: 6443
 hostServices:
@@ -247,10 +253,13 @@ EOF
 cert_manager(){
   log "CERT MANAGER ..."
 
+  helm repo add jetstack https://charts.jetstack.io --force-update && \
+  helm repo update
+  kubectl create namespace cert-manager
+  kubectl label namespace cert-manager cert-manager.io/disable-validation=true
+
   helm upgrade --install --wait --timeout 15m --atomic --namespace cert-manager --create-namespace \
-    --repo https://charts.jetstack.io cert-manager cert-manager --values - <<EOF
-installCRDs: true
-EOF
+    cert-manager jetstack/cert-manager --set installCRDs=true
 }
 
 cert_manager_ca_secret(){
@@ -278,13 +287,22 @@ metallb(){
   local METALLB_END=$(subnet_to_ip $KIND_SUBNET 255.250)
 
   helm upgrade --install --wait --timeout 15m --atomic --namespace metallb-system --create-namespace \
-    --repo https://metallb.github.io/metallb metallb metallb --values - <<EOF
-configInline:
-  address-pools:
-    - name: default
-      protocol: layer2
-      addresses:
-        - $METALLB_START-$METALLB_END
+    --repo https://metallb.github.io/metallb metallb metallb --set controller.podSecurityContext.seccompProfile.type=RuntimeDefault --set speaker.podSecurityContext.seccompProfile.type=RuntimeDefault --values - <<EOF
+labels:
+  pod-security.kubernetes.io/enforce: privileged
+  pod-security.kubernetes.io/audit: privileged
+  pod-security.kubernetes.io/warn: privileged
+EOF
+
+  kubectl apply -n metallb-system -f - <<EOF
+apiVersion: metallb.io/v1beta1
+kind: IPAddressPool
+metadata:
+  name: default
+  namespace: metallb-system
+spec:
+  addresses:
+  - $METALLB_START-$METALLB_END
 EOF
 }
 
@@ -302,21 +320,36 @@ dnsmasq(){
   log "DNSMASQ ..."
 
   local INGRESS_LB_IP=$(get_service_lb_ip ingress-nginx ingress-nginx-controller)
+  echo "Ingress LoadBalancer IP: $INGRESS_LB_IP"
+  # local LOCAL_CUSTOM_TLD="cluster"
+  if [[ "$(uname)" == "Darwin" ]]; then
+    echo "Detected Mac OS, using 'brew' to install and configure 'dnsmasq'..."
+    # brew install dnsmasq
+    
+    echo "Making config directory at $DNSMASQ_CONF_PATH"
+    mkdir -p $DNSMASQ_CONF_PATH
 
-  echo "address=/$DNSMASQ_DOMAIN/$INGRESS_LB_IP" | sudo tee /etc/dnsmasq.d/$DNSMASQ_CONF
-}
-
-restart_service(){
-  log "RESTART $1 ..."
-
-  sudo systemctl restart $1
+    echo "Writing to DNSMASQ config..."
+    echo "address=/$DNSMASQ_DOMAIN/$INGRESS_LB_IP" | sudo tee $DNSMASQ_CONF_PATH/$DNSMASQ_CONF_FILENAME
+    
+    echo "Successfully wrote to dnsmasq config. Restarting dnsmasq..."
+    sudo brew services restart dnsmasq
+    
+    echo "Creating resolver for .cluster TLD..."
+    sudo mkdir -p /etc/resolver
+    sudo echo "nameserver $INGRESS_LB_IP" > /etc/resolver/cluster
+  elif [[ "$(uname)" == "Linux" ]]; then
+    echo "address=/$DNSMASQ_DOMAIN/$INGRESS_LB_IP" | sudo tee $DNSMASQ_CONF_PATH/$DNSMASQ_CONF_FILENAME
+    echo "Successfully wrote to dnsmasq config. Restarting dnsmasq..."
+    sudo systemctl restart dnsmasq
+  fi
 }
 
 cleanup(){
   log "CLEANUP ..."
 
   kind delete cluster || true
-  sudo rm -f /etc/dnsmasq.d/$DNSMASQ_CONF
+  sudo rm -f $DNSMASQ_CONF_PATH/$DNSMASQ_CONF_FILENAME
   sudo rm -rf /usr/local/share/ca-certificates/kind.cluster
 }
 
@@ -335,7 +368,6 @@ cert_manager_ca_issuer
 metallb
 ingress
 dnsmasq
-restart_service   dnsmasq
 
 # DONE
 
